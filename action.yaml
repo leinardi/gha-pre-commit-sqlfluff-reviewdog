@@ -1,6 +1,5 @@
-# Replace `<OWNER>/<REPO>` with this action’s repository, and `<TOOL>` / `<HOOK_ID>` with the actual tool and hook name for the concrete action.
-name: "Run <TOOL> via pre-commit + reviewdog"
-description: "Runs <HOOK_ID> pre-commit hook on a diff range and reports via reviewdog"
+name: "Run sqlfluff lint/fix via pre-commit + reviewdog"
+description: "Runs sqlfluff lint (JSON) on a diff range, optionally runs sqlfluff-fix, and reports via reviewdog"
 author: "leinardi"
 branding:
   icon: "check-circle"
@@ -16,11 +15,18 @@ inputs:
   github-token:
     description: "GitHub token for reviewdog (usually secrets.GITHUB_TOKEN)"
     required: true
+  run_fix:
+    description: "Whether to also run sqlfluff-fix and comment the diff (true/false)"
+    required: false
+    default: "true"
 
 outputs:
-  exitcode:
-    description: "Exit code of the <HOOK_ID> pre-commit hook"
-    value: ${{ steps.run_hook.outputs.exitcode }}
+  lint_exitcode:
+    description: "Exit code from sqlfluff-lint-json-output"
+    value: ${{ steps.lint.outputs.lint_exitcode }}
+  fix_exitcode:
+    description: "Exit code from sqlfluff-fix (if run)"
+    value: ${{ steps.fix.outputs.fix_exitcode }}
 
 runs:
   using: "composite"
@@ -31,10 +37,12 @@ runs:
         path: ~/.cache/pre-commit
         key: pre-commit|${{ runner.os }}|${{ hashFiles('.pre-commit-config.yaml') }}
 
-    - name: Install Python deps + pre-commit
+    - name: Install Python deps, pre-commit and jq
       shell: bash
       run: |
         set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y jq
         pip install --no-cache-dir pre-commit
 
     - name: Setup reviewdog binary
@@ -42,44 +50,80 @@ runs:
       with:
         reviewdog_version: latest
 
-    # TODO: customize this step for your specific hook and parsing logic
-    - name: Run <HOOK_ID> pre-commit hook
-      id: run_hook
+    - name: Run sqlfluff lint (JSON)
+      id: lint
       shell: bash
       run: |
         set +e
         set -o pipefail
 
-        # Run the specific pre-commit hook on the diff range
-        pre-commit run <HOOK_ID> \
+        pre-commit run sqlfluff-lint-json-output \
           --hook-stage manual \
           --from-ref "${{ inputs.from-ref }}" \
           --to-ref   "${{ inputs.to-ref }}" \
           --color=never \
-          | tee hook-output.txt
+          | tee >(grep -Ev '^\[INFO\]' | tail -n +5 > sqlfluff.json)
 
-        exitcode=${PIPESTATUS[0]}
-        echo "exitcode=$exitcode" >> "$GITHUB_OUTPUT"
+        lint_rc=${PIPESTATUS[0]}
+        echo "lint_exitcode=$lint_rc" >> "$GITHUB_OUTPUT"
+
         # Do not fail here; let reviewdog decide
         exit 0
 
-    - name: Report findings via reviewdog
-      if: steps.run_hook.outputs.exitcode != '0'
+    - name: Report sqlfluff lint via reviewdog
+      if: steps.lint.outputs.lint_exitcode != '0'
       env:
         REVIEWDOG_GITHUB_API_TOKEN: ${{ inputs.github-token }}
+      continue-on-error: true
       shell: bash
       run: |
-        # TODO: adapt this part to match your tool's output format and efm
-        # For example, you might need to transform hook-output.txt lines
-        # into reviewdog's %t:%f:%l:%c:%m format.
-
-        cat hook-output.txt \
+        cat sqlfluff.json \
+          | jq -r -f "$GITHUB_ACTION_PATH/lib/sqlfluff-json-to-rdjson.jq" \
           | reviewdog \
-              -efm="%f:%l:%c: %m" \
-              -name="<TOOL>" \
+              -f=rdjson \
+              -name="sqlfluff" \
               -reporter=github-pr-review \
               -filter-mode=nofilter \
               -fail-level=info
 
-        # Fail the job if there were violations
-        exit 1
+    - name: Run sqlfluff fix
+      if: inputs.run_fix == 'true'
+      id: fix
+      shell: bash
+      run: |
+        set +e
+        set -o pipefail
+
+        pre-commit run sqlfluff-fix \
+          --from-ref "${{ inputs.from-ref }}" \
+          --to-ref   "${{ inputs.to-ref }}"
+
+        fix_rc=$?
+        echo "fix_exitcode=$fix_rc" >> "$GITHUB_OUTPUT"
+
+        # Capture diff for reviewdog suggestions
+        git diff > sqlfluff-fix.diff || true
+
+        # Do not fail here; let reviewdog decide
+        exit 0
+
+    - name: Report sqlfluff fix suggestions via reviewdog
+      if: inputs.run_fix == 'true' && steps.fix.outputs.fix_exitcode != '0'
+      env:
+        REVIEWDOG_GITHUB_API_TOKEN: ${{ inputs.github-token }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        reviewdog \
+          -name="sqlfluff-fix" \
+          -f=diff \
+          -f.diff.strip=1 \
+          -reporter=github-pr-review \
+          -filter-mode=nofilter < sqlfluff-fix.diff
+
+    - name: Fail on sqlfluff issues
+      if: |
+        steps.lint.outputs.lint_exitcode != '0' ||
+        (inputs.run_fix == 'true' && steps.fix.outputs.fix_exitcode != '0')
+      shell: bash
+      run: exit 1
